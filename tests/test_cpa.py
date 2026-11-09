@@ -113,3 +113,25 @@ def test_norm_strips_the_ban_mark_like_the_star():
     from adbot.cpa import norm
     assert norm("🚫 freestyle 1") == norm("freestyle 1") == "freestyle 1"
     assert norm("🌟 🚫 video 2：你敢吗？") == "video 2：你敢吗？"
+
+
+def test_moi_paid_tab_source_is_campaign_and_chinese_date():
+    """MOI 付款学员: campaign lives in "source" (with a trailing " ig"/" fb"), date in 報名日期."""
+    header = ["No", "名字", "付費管道", "電郵地址", "聯繫 號碼", "報名日期", "付款時間",
+              "Joined skool?", "", "Join 3 days Group", "是否諮詢", "是否已上實體課",
+              "来自哪一场次", "source ", "UTM Ads Set", "UTM Ads Name"]
+
+    def row(src, adset, ad):
+        return ["1", "x", "Stripe", "a@b.c", "60", "November 11, 2026", "", "TRUE", "",
+                "FALSE", "FALSE", "FALSE", "webinar", src, adset, ad]
+
+    values = [header,
+              row("moi-ig", "", ""),
+              row("Moi 让钱工作资产增长蓝图 Leads campaign 5 NOV 2026 ig", "MY broad", "M1Video 2"),
+              row("(Retarget) Moi Leads campaign 5 NOV 2026 fb", "engaged", "M1SI 1")]
+    sales, cols, _ = cpa.parse_sales(values, default_price=1997.0)
+    assert cols["campaign"] == 13 and cols["date"] == 5
+    assert [s.campaign for s in sales] == ["moi-ig", "moi 让钱工作资产增长蓝图 leads campaign 5 nov 2026",
+                                          "(retarget) moi leads campaign 5 nov 2026"]
+    assert all(s.date == dt.date(2026, 11, 11) for s in sales)
+    assert all(s.amount == 1997.0 for s in sales)

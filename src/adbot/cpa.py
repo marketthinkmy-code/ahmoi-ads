@@ -67,6 +67,7 @@ def creative_key(name: str) -> str:
 def find_columns(header: List[str]) -> Dict[str, int]:
     """Locate date / campaign / adset / ad / amount columns by fuzzy header match."""
     keys = [_hkey(h) for h in header]
+    raw = [(h or "").strip() for h in header]
 
     def first(*needles_in_order) -> int:
         for needle in needles_in_order:                 # exact-ish matches first
@@ -79,13 +80,35 @@ def find_columns(header: List[str]) -> Dict[str, int]:
                     return i
         return -1
 
+    def first_raw(*labels) -> int:
+        # _hkey drops non-ASCII, so Chinese headers need a raw-text match.
+        for label in labels:
+            for i, h in enumerate(raw):
+                if h == label:
+                    return i
+        return -1
+
+    def pick(*idxs) -> int:
+        return next((i for i in idxs if i >= 0), -1)
+
     return {
-        "date": first("createddate", "date"),
-        "campaign": first("utmcampaign"),
+        # MOI 付款学员: the purchase date sits in 報名日期 ("October 21, 2026").
+        "date": pick(first("createddate", "date"), first_raw("報名日期", "报名日期")),
+        # MOI keeps the Meta campaign name in "source" (owner 2026-11-09: 「Sources 当作是 campaign」).
+        "campaign": pick(first("utmcampaign"), first("source")),
         "adset": first("utmadset", "utmadsset"),
         "ad": first("utmadname", "utmadsname"),
         "amount": first("purchaseamount", "amount"),
     }
+
+
+# MOI's landing page appends the utm_source (" ig" / " fb") to the campaign name it
+# writes into "source"; strip it so the value equals the Meta campaign name again.
+_SOURCE_SUFFIX = re.compile(r"\s+(ig|fb)$")
+
+
+def campaign_key(name: str) -> str:
+    return _SOURCE_SUFFIX.sub("", norm(name))
 
 
 _MONTHS = {m.lower(): i for i, m in enumerate(calendar.month_abbr) if m}
@@ -172,7 +195,7 @@ def parse_sales(values: List[List[str]], default_price: float):
             idx = cols.get(key, -1)
             return row[idx] if 0 <= idx < len(row) else ""
 
-        campaign, ad = norm(cell("campaign")), norm(cell("ad"))
+        campaign, ad = campaign_key(cell("campaign")), norm(cell("ad"))
         if not campaign and not ad:
             continue
         sales.append(Sale(parse_date(cell("date")), campaign, norm(cell("adset")),

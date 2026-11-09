@@ -8,10 +8,11 @@ name: adbot · daily report (~22:09 MYT)
 # a manual run always posts.
 
 on:
-  schedule:
-    - cron: "9 14 * * *"        # 22:09 MYT (primary; off the congested ":00" slot)
-    - cron: "39 14 * * *"       # 22:39 MYT (backup 1 — only posts if the primary was dropped)
-    - cron: "9 15 * * *"        # 23:09 MYT (backup 2)
+  # ⏸ schedule disabled for the MOI setup (2026-11-09): re-enable only after the owner approves go-live.
+  # schedule:
+  #   - cron: "9 14 * * *"        # 22:09 MYT (primary; off the congested ":00" slot)
+  #   - cron: "39 14 * * *"       # 22:39 MYT (backup 1 — only posts if the primary was dropped)
+  #   - cron: "9 15 * * *"        # 23:09 MYT (backup 2)
   workflow_dispatch: {}          # manual run from the Actions tab — always posts
 
 permissions:
