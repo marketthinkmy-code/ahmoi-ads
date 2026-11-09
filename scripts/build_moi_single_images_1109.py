@@ -3,10 +3,12 @@
 
 Owner request 2026-11-09: put the 5 new single images into ONE ad set, CBO, Malaysia +
 Singapore, daily budget RM100, copy written in the style of MOI's existing course ads.
+Later the same day: 5 more retirement / FU Money images (SI06–SI10) go into the SAME ad set.
+The campaign name keeps "x5" because the build finds the campaign by that exact name.
 
 Run through the ops workflow (adbot-ops.yml, script=build_moi_single_images_1109.py):
   confirm=false -> dry run: print every payload, create nothing
-  confirm=true  -> upload the 5 images and create campaign / ad set / 5 ads, all PAUSED
+  confirm=true  -> upload the images and create campaign / ad set / ads, all PAUSED
 Resumable: reuses the campaign / ad set / ads already created under these names (no duplicates).
 The owner reviews in Ads Manager and switches the campaign on by hand.
 """
@@ -194,6 +196,168 @@ ADS = [
 
 在《让钱工作，资产增长蓝图》免费线上分享会，我会带你：
 🎯 根据理想生活，估算自己的 FU Money 目标。
+🧭 通过 FTP 投资决策系统，理清「买什么、什么时候买、买多少」。
+🛡️ 学习分配资金，降低一次判断错误对整体资产的影响。
+
+{CTA_LINE}
+
+{DISCLAIMER}""",
+    },
+    # ── SI06–SI10: retirement / FU Money set (owner 2026-11-09, same ad set) ──
+    {
+        "file": "si06_retire-salary-stops.jpg",
+        "name": "MOI SI06｜退休后工资停了，生活费从哪里来",
+        "body": f"""💰 退休后，工资停了。每个月的生活费，从哪里来？
+
+做工的时候，每个月有工资进来，买菜、交通、医疗，都不用想太多。
+但退休那天开始，工资单就停了。
+账单，不会跟着停。🧾
+
+很多人的退休计划，只有一句：「到时候再算。」
+可是等到时候才算，能调整的空间已经很少。
+
+我会先问自己三个问题👇
+
+1️⃣ 退休后，每个月大概要花多少？
+2️⃣ 这些开销，打算靠什么支付？EPF、积蓄，还是资产带来的现金流？
+3️⃣ 照现在的速度，够不够？不够的话，还差多少？
+
+这个「还差多少」，就是我说的 FU Money。
+早点算出来，你才有时间准备。⏳
+
+{ME}
+
+在《让钱工作，资产增长蓝图》免费线上分享会，我会带你：
+🎯 根据退休后的生活开销，估算自己的 FU Money 目标。
+🧭 通过 FTP 投资决策系统，理清「买什么、什么时候买、买多少」。
+🛡️ 学习分配资金，降低一次判断错误对整体资产的影响。
+
+{CTA_LINE}
+
+{DISCLAIMER}""",
+    },
+    {
+        "file": "si07_same-100k-diff-spend.jpg",
+        "name": "MOI SI07｜同样存了 RM100K，退休开销不同差多少",
+        "body": f"""💰 同样存了 RM100,000，退休开销不同，今天需要的启动本金差多少？
+
+看图里的两个示例👇
+📌 示例 A：现有本金 RM100,000，每月退休开销 RM3,000
+📌 示例 B：现有本金 RM100,000，每月退休开销 RM6,000
+
+其他条件都一样，只差在退休后想怎样过。
+B 每个月多花 RM3,000，看起来不多。
+但放在退休后的十几、二十年里，需要准备的资产，会差很远。
+
+所以退休规划的第一步，不是问「买什么回报最高」，
+而是先问：「我退休后，每个月到底要花多少？」🧭
+
+开销定了，才算得出：
+✅ 你需要累积多少资产；
+✅ 今天要从多少本金开始；
+✅ 每个月还要投入多少。
+
+图上的答案，我留在分享会，带你用自己的数字算一次。
+
+{ME}
+
+来参加《让钱工作，资产增长蓝图》免费线上分享会：
+🎯 根据现有本金、每月可投入金额和理想生活，估算自己的 FU Money 目标。
+🧭 通过 FTP 投资决策系统，理清「买什么、什么时候买、买多少」。
+
+{CTA_LINE}
+
+⚠️ 示例只用来说明计算方法，实际数字因人而异。
+{DISCLAIMER}""",
+    },
+    {
+        "file": "si08_retire-at-55.jpg",
+        "name": "MOI SI08｜想在 55 岁退休，今天需要多少本金",
+        "body": f"""💰 想在 55 岁退休，今天需要多少本金开始？
+
+很多人存钱的方式是：能存多少就存多少，存到某一天，再看看够不够。
+我建议你反过来，从终点倒推👇
+
+📍 先定目标：几岁想退休？（例如 55 岁）
+📍 再算开销：退休后，每个月要花多少？
+📍 最后倒推：今天需要多少启动本金，每个月要投入多少，才来得及？
+
+终点越清楚，今天要做的决定就越简单。
+离目标还有多少年，也决定了你每个月的压力有多大。
+越早开始，时间越站在你这边。⏳
+
+{ME}
+
+在《让钱工作，资产增长蓝图》免费线上分享会，我会带你：
+🎯 从目标年龄和生活开销，倒推今天需要的本金，算出自己的 FU Money。
+🧭 通过 FTP 投资决策系统，理清「买什么、什么时候买、买多少」。
+🛡️ 学习分配资金，降低一次判断错误对整体资产的影响。
+
+{CTA_LINE}
+
+{DISCLAIMER}""",
+    },
+    {
+        "file": "si09_three-jobs-for-money.jpg",
+        "name": "MOI SI09｜钱赚回来了，接下来派它去做什么",
+        "body": f"""💰 钱已经赚回来了。接下来，要派它去做什么？
+
+你很努力，才把这笔钱赚回来。
+但如果每一块钱都放在同一个地方，它们其实没有分工。
+
+我会先把手上的钱分成三份👇
+
+📅 近期要用的钱
+几年内要用的，例如买车、装修、孩子学费。不跟市场赌时间。
+
+☂️ 应急备用的钱
+生病、失业、突发状况时用。要随时拿得到。
+
+🌱 可以长期投资的钱
+短时间内不会动用，市场波动也不用急着卖。这一份，才适合派去长期工作。
+
+分清楚之后，再回到退休目标：
+长期那一份，要累积到多少，才够你退休？
+
+先算退休目标，再安排手上这笔钱。🧭
+
+{ME}
+我买之前，会看 FTP 三件事：
+{FTP}
+
+来参加《让钱工作，资产增长蓝图》免费线上分享会，
+算出自己的 FU Money，再决定每一份钱该去哪里。
+
+{CTA_LINE}
+
+{DISCLAIMER}""",
+    },
+    {
+        "file": "si10_gap-to-retirement.jpg",
+        "name": "MOI SI10｜手上这笔钱，离退休还差多少",
+        "body": f"""💰 手上这笔钱，离退休还差多少？
+
+很多人知道自己存了多少，却不知道自己需要多少。
+只有一个数字，是算不出「差距」的👇
+
+📌 现有本金：RM____
+📌 你的 FU Money：RM____
+📌 还差：RM____
+
+第一格，你已经知道。
+第二格，要从你想过的退休生活倒推出来。
+算出第三格之后，你才知道：每个月要投入多少、要多少年、要怎样安排。
+
+来分享会之前，先准备两个数字：
+1️⃣ 你现在的本金，大概有多少；
+2️⃣ 你每个月的生活开销，大概多少。
+
+我会在分享会上，带你算出你自己的 FU Money。🧮
+
+{ME}
+
+在《让钱工作，资产增长蓝图》免费线上分享会，你会学到：
+🎯 根据现有本金和理想生活，估算自己的 FU Money 目标。
 🧭 通过 FTP 投资决策系统，理清「买什么、什么时候买、买多少」。
 🛡️ 学习分配资金，降低一次判断错误对整体资产的影响。
 
