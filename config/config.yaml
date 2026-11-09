@@ -10,7 +10,7 @@ meta:
   instagram_user_id: "17841438769308083"
   pixel_id: "1654213532722358"
 
-  objective: "OUTCOME_SALES"
+  objective: "OUTCOME_LEADS"               # same as MOI's existing «Leads campaign …» (optimises COMPLETE_REGISTRATION)
   optimization_goal: "OFFSITE_CONVERSIONS"
   conversion_event: "COMPLETE_REGISTRATION"
   custom_conversions: []                          # TODO: if registrations come from Webinarkit, add its custom conversion id (SB uses one)
@@ -21,7 +21,9 @@ meta:
     link_url: "https://fumoneyblueprint.com/register-page"
   conversion_domain: "https://fumoneyblueprint.com/"
   call_to_action: "LEARN_MORE"
-  url_tags: "utm_source={{adset.name}}&utm_medium={{placement}}&utm_campaign={{campaign.name}}&utm_content={{ad.name}}"
+  # MOI landing-page UTM format (matches the existing ads + the 付款学员 sheet):
+  # source=fb/ig · medium=ad set · campaign=campaign · content=ad · term=placement
+  url_tags: "utm_source={{site_source_name}}&utm_medium={{adset.name}}&utm_campaign={{campaign.name}}&utm_content={{ad.name}}&utm_term={{placement}}"
 
   budget:
     level: "CAMPAIGN"                    # CBO
