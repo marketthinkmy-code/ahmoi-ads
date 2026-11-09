@@ -1,0 +1,604 @@
+import math
+
+import datetime as dt
+
+from adbot import cpa
+from adbot.monitor_cpl import (BANNED_CREATIVE, CPA_MANUAL_HOLD, INSUFFICIENT_SPEND, MANUAL_HOLD, NAME_RESCUED,
+                               NO_RESULTS_YET, OVER_THRESHOLD, SOFT_REDUCE_PREFIX,
+                               WITHIN_THRESHOLD, ZERO_RESULTS,
+                               _label_dates, cpl_window, decide, evaluate_account, extract_results,
+                               parse_metrics, result_action_type, run, soft_reduce_action,
+                               _week_start_thursday)
+from adbot.settings import ComplianceCfg, CpaCfg, KpiCfg, MetaCfg, Settings
+
+KPI = KpiCfg(cpl_threshold_myr=40, cpl_min_spend_myr=80, pause_zero_lead_after_spend=True)
+
+
+def test_insufficient_spend_is_skipped():
+    should, reason, cpl = decide(50, 0, KPI)
+    assert not should and reason == INSUFFICIENT_SPEND and cpl is None
+
+
+def test_zero_results_after_min_spend_pauses():
+    should, reason, cpl = decide(100, 0, KPI)
+    assert should and reason == ZERO_RESULTS and cpl == math.inf
+
+
+def test_zero_results_kept_when_disabled():
+    kpi = KpiCfg(cpl_threshold_myr=40, cpl_min_spend_myr=80, pause_zero_lead_after_spend=False)
+    should, reason, _ = decide(100, 0, kpi)
+    assert not should and reason == NO_RESULTS_YET
+
+
+def test_cpl_over_threshold_pauses():
+    should, reason, cpl = decide(100, 1, KPI)
+    assert should and reason == OVER_THRESHOLD and round(cpl) == 100
+
+
+def test_cpl_within_threshold_keeps():
+    should, reason, cpl = decide(100, 4, KPI)
+    assert not should and reason == WITHIN_THRESHOLD and cpl == 25
+
+
+def test_result_action_type_is_exact_offsite_pixel_event():
+    assert result_action_type("COMPLETE_REGISTRATION") == "offsite_conversion.fb_pixel_complete_registration"
+    assert result_action_type("LEAD") == "offsite_conversion.fb_pixel_lead"
+
+
+def test_extract_results_counts_only_the_exact_bucket():
+    # Meta reports the SAME conversion under several overlapping buckets; only the exact
+    # offsite-pixel one is Ads Manager "Results". Summing the rest 5x-overcounts (the bug).
+    rat = result_action_type("COMPLETE_REGISTRATION")
+    actions = [
+        {"action_type": "offsite_conversion.fb_pixel_complete_registration", "value": "2"},
+        {"action_type": "complete_registration", "value": "2"},
+        {"action_type": "omni_complete_registration", "value": "2"},
+        {"action_type": "offsite_complete_registration_add_meta_leads", "value": "2"},
+        {"action_type": "offsite_complete_registration_add_20_s_calls", "value": "2"},
+        {"action_type": "onsite_conversion.post_net_like", "value": "4"},
+    ]
+    assert extract_results(actions, rat) == 2
+
+
+def test_parse_metrics_reads_spend_and_results():
+    rat = result_action_type("COMPLETE_REGISTRATION")
+    insight = {"spend": "120.50", "actions": [{"action_type": rat, "value": "2"},
+                                              {"action_type": "complete_registration", "value": "2"}]}
+    spend, results = parse_metrics(insight, rat)
+    assert spend == 120.5 and results == 2
+
+
+def test_parse_metrics_handles_empty():
+    assert parse_metrics(None, "offsite_conversion.fb_pixel_complete_registration") == (0.0, 0.0)
+
+
+# ── evaluate_account: whole-account scope, ad-level decisions, registration-only guard ──
+class _FakeGraph:
+    def __init__(self, campaigns, ads_by_campaign, insights):
+        self._campaigns, self._ads, self._insights = campaigns, ads_by_campaign, insights
+
+    def list_campaigns(self, account_path):
+        return self._campaigns
+
+    def list_ads_under_campaign(self, campaign_id):
+        return self._ads.get(campaign_id, [])
+
+    def account_insights(self, account_path, *, level, fields, date_preset=None, time_range=None):
+        # evaluate_account now pulls every ad's CPL in ONE account-level call (was a
+        # get_ad_insight per ad — that tripped Meta's rate limit). Mirror that batched shape.
+        return [{"ad_id": aid, **row} for aid, row in self._insights.items()]
+
+
+def _ad(ad_id, status="ACTIVE", event="COMPLETE_REGISTRATION", created_time="2026-01-01"):
+    return {"id": ad_id, "name": ad_id, "effective_status": status, "created_time": created_time,
+            "adset": {"promoted_object": {"custom_event_type": event} if event else {}}}
+
+
+def _reg_insight(spend, results):
+    rat = result_action_type("COMPLETE_REGISTRATION")
+    return {"spend": str(spend), "actions": [{"action_type": rat, "value": str(results)}]}
+
+
+def test_evaluate_account_is_whole_account_ad_level_and_registration_only():
+    settings = Settings(meta=MetaCfg(conversion_event="COMPLETE_REGISTRATION"),
+                        kpi=KpiCfg(cpl_threshold_myr=40, cpl_min_spend_myr=80,
+                                   cpl_lookback="last_3d", pause_zero_lead_after_spend=True))
+    campaigns = [
+        {"id": "A", "name": "MTC - Watches", "effective_status": "ACTIVE"},
+        {"id": "B", "name": "STOCKBLOOM | Y", "effective_status": "PAUSED"},  # whole campaign off
+    ]
+    ads = {
+        "A": [
+            _ad("over"),                          # spend 100 / 1 reg -> CPL 100 -> PAUSE
+            _ad("within"),                        # spend 100 / 4 reg -> CPL 25 -> keep
+            _ad("paused_ad", status="PAUSED"),    # not ACTIVE -> skipped
+            _ad("purchase", event="PURCHASE"),    # wrong optimized event -> guard skips
+            _ad("zero"),                          # spend 100 / 0 reg -> PAUSE (zero results)
+        ],
+        "B": [_ad("under_paused_campaign")],      # active ad but campaign paused -> skipped
+    }
+    insights = {"over": _reg_insight(100, 1), "within": _reg_insight(100, 4),
+                "purchase": _reg_insight(100, 1), "zero": _reg_insight(100, 0),
+                "under_paused_campaign": _reg_insight(100, 1)}
+
+    decisions = evaluate_account(_FakeGraph(campaigns, ads, insights), settings)
+
+    assert {d.name for d in decisions} == {"over", "within", "zero"}
+    assert {d.name for d in decisions if d.should_pause} == {"over", "zero"}
+
+
+def test_evaluate_account_hold_list_exempts_over_ceiling_ad():
+    settings = Settings(meta=MetaCfg(conversion_event="COMPLETE_REGISTRATION"),
+                        kpi=KpiCfg(cpl_threshold_myr=40, cpl_min_spend_myr=80,
+                                   cpl_lookback="last_3d", pause_zero_lead_after_spend=True,
+                                   cpl_hold=["街头突击"]))
+    campaigns = [{"id": "A", "name": "MTC", "effective_status": "ACTIVE"}]
+    ads = {"A": [_ad("Video 6：街头突击采访"), _ad("plain_over")]}
+    insights = {"Video 6：街头突击采访": _reg_insight(300, 5),  # CPL 60 > 40, but held
+                "plain_over": _reg_insight(100, 1)}            # CPL 100 -> still paused
+    by_name = {d.name: d for d in evaluate_account(_FakeGraph(campaigns, ads, insights), settings)}
+
+    assert by_name["Video 6：街头突击采访"].should_pause is False
+    assert by_name["Video 6：街头突击采访"].reason == MANUAL_HOLD
+    assert by_name["plain_over"].should_pause is True
+
+
+def test_week_to_date_cpl_window_from_thursday():
+    # Jun 18 2026 is a Thursday; Jun 22 is the following Monday.
+    assert _week_start_thursday(dt.date(2026, 6, 22)) == dt.date(2026, 6, 18)  # Mon -> prior Thu
+    assert _week_start_thursday(dt.date(2026, 6, 18)) == dt.date(2026, 6, 18)  # Thu -> itself
+    assert _week_start_thursday(dt.date(2026, 6, 24)) == dt.date(2026, 6, 18)  # Wed -> prior Thu
+    s = Settings(kpi=KpiCfg(cpl_lookback="week_thu"))
+    assert cpl_window(s, dt.date(2026, 6, 22)) == (None, {"since": "2026-06-18", "until": "2026-06-22"})
+    assert cpl_window(Settings(kpi=KpiCfg(cpl_lookback="last_3d")), dt.date(2026, 6, 22)) == ("last_3d", None)
+
+
+def test_evaluate_account_cpa_rescues_and_hard_stops():
+    # CPA folded into the CPL decision (60-day window), via an injected context.
+    settings = Settings(meta=MetaCfg(conversion_event="COMPLETE_REGISTRATION"),
+                        kpi=KpiCfg(cpl_threshold_myr=40, cpl_min_spend_myr=80,
+                                   cpl_lookback="last_3d", pause_zero_lead_after_spend=True),
+                        cpa=CpaCfg(enabled=True, hard_stop_myr=1200, conversion_days=14,
+                                   min_spend_myr=1000))
+    campaigns = [{"id": "A", "name": "MTC - News", "effective_status": "ACTIVE"}]
+    ads = {"A": [_ad("rescue_me"), _ad("kill_me")]}
+    insights = {"rescue_me": _reg_insight(300, 3),   # CPL 100 > 40 -> CPL would pause
+                "kill_me": _reg_insight(100, 4)}      # CPL 25 -> CPL keeps
+    ck = cpa.norm("mtc - news")
+    sold = {(ck, "", cpa.norm("rescue_me")): 10, (ck, "", cpa.norm("kill_me")): 2}
+    spend60 = {"rescue_me": 7000.0, "kill_me": 4000.0}  # CPA 700 (rescue) / 2000 (hard stop)
+
+    by_name = {d.name: d for d in evaluate_account(
+        _FakeGraph(campaigns, ads, insights), settings, cpa_ctx=(sold, spend60))}
+
+    assert by_name["rescue_me"].should_pause is False
+    assert by_name["rescue_me"].reason == cpa.CPL_RESCUED          # over-CPL but profitable
+    assert by_name["kill_me"].should_pause is True
+    assert by_name["kill_me"].reason == cpa.HARD_STOP              # CPA>1200, matured -> pause
+
+
+def test_evaluate_account_name_fallback_rescues_renamed_campaign():
+    # The 你敢吗 case (2026-08): the campaign was RENAMED in Ads Manager after sales were
+    # recorded, so the strict (campaign, ad) join finds nothing. The ad-name-only fallback
+    # must rescue the converting ad — and must never create a pause on its own.
+    settings = Settings(meta=MetaCfg(conversion_event="COMPLETE_REGISTRATION"),
+                        kpi=KpiCfg(cpl_threshold_myr=40, cpl_min_spend_myr=80,
+                                   cpl_lookback="last_3d", pause_zero_lead_after_spend=True),
+                        cpa=CpaCfg(enabled=True, hard_stop_myr=1200, conversion_days=14,
+                                   min_spend_myr=1000))
+    campaigns = [{"id": "A", "name": "RENAMED | NEW NAME", "effective_status": "ACTIVE"}]
+    ads = {"A": [_ad("rescue_me"), _ad("still_over"), _ad("expensive_creative")]}
+    insights = {"rescue_me": _reg_insight(300, 3),          # CPL 100 -> CPL would pause
+                "still_over": _reg_insight(300, 3),         # CPL 100, no sales anywhere -> pause
+                "expensive_creative": _reg_insight(300, 3)}  # name-match CPA over hard stop
+    old_ck = cpa.norm("old campaign name")                  # sales carry the pre-rename UTM
+    sold = {(old_ck, cpa.norm("rescue_me")): 3, (old_ck, cpa.norm("expensive_creative")): 1}
+    sold_by_ad = {cpa.norm("rescue_me"): 3, cpa.norm("expensive_creative"): 1}
+    spend60 = {"rescue_me": 900.0,             # 900/3 = CPA 300 <= 1200 -> name rescue
+               "still_over": 500.0,
+               "expensive_creative": 2000.0}   # 2000/1 = CPA 2000 > 1200 -> no rescue
+
+    by_name = {d.name: d for d in evaluate_account(
+        _FakeGraph(campaigns, ads, insights), settings,
+        cpa_ctx=(sold, sold_by_ad, spend60))}
+
+    # owner 2026-10-25: name-only rescue retired — sales on another campaign's copy protect nothing
+    assert by_name["rescue_me"].should_pause is True
+    assert by_name["rescue_me"].reason == OVER_THRESHOLD
+    assert by_name["still_over"].should_pause is True
+    assert by_name["expensive_creative"].should_pause is True  # too-expensive name match: no rescue
+    assert by_name["expensive_creative"].reason == OVER_THRESHOLD  # CPL verdict stands, no CPA pause
+
+
+def test_creative_key_strips_edition_prefixes():
+    # HOOK：/重拍： re-cuts must inherit the original creative's sales in the rescue index
+    assert cpa.creative_key("HOOK：Video 12：炒过那么多") == cpa.norm("Video 12：炒过那么多")
+    assert cpa.creative_key("重拍：Video 5：盖电脑，喂！") == cpa.norm("Video 5：盖电脑，喂！")
+    assert cpa.creative_key("🌟 HOOK：重拍：x") == cpa.norm("x")   # stacked prefixes + star
+    assert cpa.creative_key("拼接：Video 1：用我的方法") == cpa.norm("Video 1：用我的方法")
+    assert cpa.creative_key("video 8：做么你") == cpa.norm("video 8：做么你")  # no-op otherwise
+
+
+def test_name_fallback_rescues_prefixed_recut(monkeypatch):
+    # Live ad «HOOK：rescue_me» in a new campaign; sheet sales sit under «rescue_me»
+    # with an old campaign UTM. The prefix-proof rescue must still block the pause.
+    settings = Settings(meta=MetaCfg(conversion_event="COMPLETE_REGISTRATION"),
+                        kpi=KpiCfg(cpl_threshold_myr=40, cpl_min_spend_myr=80,
+                                   cpl_lookback="last_3d", pause_zero_lead_after_spend=True),
+                        cpa=CpaCfg(enabled=True, hard_stop_myr=1200, conversion_days=14,
+                                   min_spend_myr=1000))
+    campaigns = [{"id": "A", "name": "NEW HOOK CAMP", "effective_status": "ACTIVE"}]
+    ads = {"A": [_ad("HOOK：rescue_me")]}
+    insights = {"HOOK：rescue_me": _reg_insight(300, 3)}     # CPL 100 -> would pause
+    sold_by_ad = {cpa.creative_key("rescue_me"): 2}
+    spend60 = {"HOOK：rescue_me": 800.0}                     # 800/2 = CPA 400 <= 1200
+
+    by_name = {d.name: d for d in evaluate_account(
+        _FakeGraph(campaigns, ads, insights), settings, cpa_ctx=({}, sold_by_ad, spend60))}
+
+    assert by_name["HOOK：rescue_me"].should_pause is True     # no cross-copy rescue (owner 10/25)
+
+
+# ── TEMPORARY soft-reduce (owner 2026-09-10「先降 30%，再犯才关」) ──────────────────────────
+# 2026-09-10 is a Thursday (the week start); 9/11 Fri, 9/12 Sat, 9/9 the Wednesday before.
+
+def test_soft_reduce_first_breach_cuts_30pct():
+    assert soft_reduce_action([], dt.date(2026, 9, 11), 200.0, 0.30, 30.0) == ("reduce", 140.0)
+
+
+def test_soft_reduce_same_day_grace_then_later_day_pause():
+    thu = dt.date(2026, 9, 10)
+    assert soft_reduce_action([thu], thu, 140.0, 0.30, 30.0) == ("skip", None)
+    assert soft_reduce_action([thu], dt.date(2026, 9, 12), 140.0, 0.30, 30.0) == ("pause", None)
+
+
+def test_soft_reduce_last_weeks_cut_does_not_count_as_a_strike():
+    # cut last Wednesday; the new Thu-week starts fresh -> reduce again, not pause
+    assert soft_reduce_action([dt.date(2026, 9, 9)], dt.date(2026, 9, 11),
+                              100.0, 0.30, 30.0) == ("reduce", 70.0)
+
+
+def test_soft_reduce_at_floor_or_invisible_budget_escalates_to_pause():
+    assert soft_reduce_action([], dt.date(2026, 9, 11), 30.0, 0.30, 30.0) == ("pause", None)
+    assert soft_reduce_action([], dt.date(2026, 9, 11), 0.0, 0.30, 30.0) == ("pause", None)
+
+
+def test_label_dates_parses_only_our_prefix():
+    labels = [{"name": f"{SOFT_REDUCE_PREFIX}2026-09-10"}, {"name": "ADBOT_WEEKLY_OFF"},
+              {"name": f"{SOFT_REDUCE_PREFIX}garbage"}, {"id": "no-name"}]
+    assert _label_dates(labels, SOFT_REDUCE_PREFIX) == [dt.date(2026, 9, 10)]
+
+
+class _FakeGraphSoft(_FakeGraph):
+    """_FakeGraph plus the write/label surface run() touches in soft-reduce mode."""
+
+    def __init__(self, campaigns, ads_by_campaign, insights, entity_labels=None, bare_list=False):
+        super().__init__(campaigns, ads_by_campaign, insights)
+        self.entity_labels = entity_labels or {}
+        self.bare_list = bare_list
+        self.budget_posts, self.paused, self.labels_set = [], [], []
+        self.created_label = None
+
+    def get_object(self, object_id, fields):
+        assert fields == "adlabels"
+        labels = self.entity_labels.get(object_id, [])
+        return {"adlabels": labels if self.bare_list else {"data": labels}}
+
+    def get_or_create_label(self, account_path, name):
+        self.created_label = name
+        return "LBL_NEW"
+
+    def set_ad_labels(self, entity_id, label_ids):
+        self.labels_set.append((entity_id, tuple(label_ids)))
+
+    def update_daily_budget(self, entity_id, budget_cents):
+        self.budget_posts.append((entity_id, budget_cents))
+
+    def update_status(self, entity_id, status):
+        assert status == "PAUSED"
+        self.paused.append(entity_id)
+
+
+def _soft_ad(ad_id, adset_id, adset_budget_myr):
+    return {"id": ad_id, "name": ad_id, "effective_status": "ACTIVE",
+            "created_time": "2026-01-01", "adset_id": adset_id,
+            "adset": {"promoted_object": {"custom_event_type": "COMPLETE_REGISTRATION"},
+                      "daily_budget": str(int(adset_budget_myr * 100))}}
+
+
+def test_run_soft_reduce_cuts_carrier_once_spares_ads_keeps_zero_pause_hard(monkeypatch):
+    monkeypatch.setattr("adbot.monitor_cpl.state.append_pause_log", lambda *a, **k: None)
+    today = (dt.datetime.utcnow() + dt.timedelta(hours=8)).date()  # matches run()'s MYT clock
+    settings = Settings(meta=MetaCfg(conversion_event="COMPLETE_REGISTRATION"),
+                        kpi=KpiCfg(cpl_threshold_myr=40, cpl_min_spend_myr=80,
+                                   cpl_lookback="last_3d", pause_zero_lead_after_spend=True,
+                                   cpl_soft_reduce=True))
+    campaigns = [{"id": "C", "name": "STOCKBLOOM | X", "effective_status": "ACTIVE"}]
+    ads = {"C": [_soft_ad("over_a", "AS1", 200), _soft_ad("over_b", "AS1", 200),  # shared carrier
+                 _soft_ad("zero", "AS2", 100),
+                 _soft_ad("graced", "AS3", 140)]}
+    insights = {"over_a": _reg_insight(100, 1), "over_b": _reg_insight(90, 1),
+                "zero": _reg_insight(100, 0), "graced": _reg_insight(200, 2)}
+    labels = {"AS3": [{"id": "L3", "name": f"{SOFT_REDUCE_PREFIX}{today}"}]}  # cut earlier today
+    graph = _FakeGraphSoft(campaigns, ads, insights, labels)
+
+    out = run(graph, settings)
+
+    assert graph.budget_posts == [("AS1", 14000)]        # ONE −30% cut for the shared carrier
+    assert graph.created_label == f"{SOFT_REDUCE_PREFIX}{today}"
+    assert ("AS1", ("LBL_NEW",)) in graph.labels_set     # the date label is the cross-run state
+    assert graph.paused == ["zero"]                      # zero-results still pauses immediately
+    assert out["reduced"] == 1 and out["paused"] == 1    # graced ad: no cut, no pause
+
+
+def test_run_soft_reduce_reads_bare_list_adlabels(monkeypatch):
+    # Live Graph returns campaign.adlabels as a bare list — must still reduce, not fall back to pause.
+    monkeypatch.setattr("adbot.monitor_cpl.state.append_pause_log", lambda *a, **k: None)
+    settings = Settings(meta=MetaCfg(conversion_event="COMPLETE_REGISTRATION"),
+                        kpi=KpiCfg(cpl_threshold_myr=40, cpl_min_spend_myr=80,
+                                   cpl_lookback="last_3d", pause_zero_lead_after_spend=True,
+                                   cpl_soft_reduce=True))
+    campaigns = [{"id": "C", "name": "STOCKBLOOM | X", "effective_status": "ACTIVE"}]
+    ads = {"C": [_soft_ad("over", "AS1", 200)]}
+    graph = _FakeGraphSoft(campaigns, ads, {"over": _reg_insight(100, 1)},
+                           {"AS1": [{"id": "L0", "name": "ADBOT_WEEKLY_OFF"}]}, bare_list=True)
+
+    out = run(graph, settings)
+
+    assert graph.budget_posts == [("AS1", 14000)] and graph.paused == []
+    assert ("AS1", ("L0", "LBL_NEW")) in graph.labels_set
+    assert out["reduced"] == 1 and out["paused"] == 0
+
+
+def test_run_soft_reduce_spares_carrier_whose_total_cpl_is_under_line(monkeypatch):
+    # One over-line ad inside a carrier that is under the line overall: pause that ad, keep the budget.
+    monkeypatch.setattr("adbot.monitor_cpl.state.append_pause_log", lambda *a, **k: None)
+    settings = Settings(meta=MetaCfg(conversion_event="COMPLETE_REGISTRATION"),
+                        kpi=KpiCfg(cpl_threshold_myr=40, cpl_min_spend_myr=80,
+                                   cpl_lookback="last_3d", pause_zero_lead_after_spend=True,
+                                   cpl_soft_reduce=True))
+    campaigns = [{"id": "C", "name": "STOCKBLOOM | X", "effective_status": "ACTIVE"}]
+    ads = {"C": [_soft_ad("bad", "AS1", 200), _soft_ad("good", "AS1", 200)]}
+    insights = {"bad": _reg_insight(100, 1), "good": _reg_insight(100, 9)}     # carrier CPL 20
+    graph = _FakeGraphSoft(campaigns, ads, insights)
+
+    out = run(graph, settings)
+
+    assert graph.budget_posts == [] and graph.paused == ["bad"]
+    assert out["reduced"] == 0 and out["paused"] == 1
+
+
+def test_hold_ad_until_exempts_that_ad_through_the_date(monkeypatch):
+    monkeypatch.setattr("adbot.monitor_cpl.state.append_pause_log", lambda *a, **k: None)
+    today = (dt.datetime.utcnow() + dt.timedelta(hours=8)).date()
+    settings = Settings(meta=MetaCfg(conversion_event="COMPLETE_REGISTRATION"),
+                        kpi=KpiCfg(cpl_threshold_myr=40, cpl_min_spend_myr=80,
+                                   cpl_lookback="last_3d", pause_zero_lead_after_spend=True,
+                                   hold_ad_until={"held": today.isoformat(),
+                                                  "expired": (today - dt.timedelta(days=1)).isoformat()}))
+    campaigns = [{"id": "C", "name": "STOCKBLOOM | X", "effective_status": "ACTIVE"}]
+    ads = {"C": [_soft_ad("held", "AS1", 200), _soft_ad("expired", "AS2", 200)]}
+    graph = _FakeGraphSoft(campaigns, ads, {"held": _reg_insight(100, 0), "expired": _reg_insight(100, 0)})
+
+    run(graph, settings)
+
+    assert graph.paused == ["expired"]
+
+
+def test_strict_rescue_needs_same_campaign_adset_and_ad():
+    # owner 2026-10-25: only the exact (campaign, ad set, ad) that sold is protected.
+    settings = Settings(meta=MetaCfg(conversion_event="COMPLETE_REGISTRATION"),
+                        kpi=KpiCfg(cpl_threshold_myr=40, cpl_min_spend_myr=80,
+                                   cpl_lookback="last_3d", pause_zero_lead_after_spend=True),
+                        cpa=CpaCfg(enabled=True, hard_stop_myr=1200, conversion_days=14, min_spend_myr=1000))
+    campaigns = [{"id": "A", "name": "CAMP", "effective_status": "ACTIVE"}]
+    sold_ad = _ad("winner"); sold_ad["adset"]["name"] = "Set A"
+    copy_ad = _ad("winner_copy"); copy_ad["name"] = "winner"; copy_ad["adset"]["name"] = "Set B"
+    ads = {"A": [sold_ad, copy_ad]}
+    insights = {"winner": _reg_insight(300, 3), "winner_copy": _reg_insight(300, 3)}   # both CPL 100 > 40
+    ck = cpa.norm("camp")
+    sold = {(ck, cpa.norm("set a"), cpa.norm("winner")): 2}
+    spend60 = {"winner": 800.0, "winner_copy": 800.0}
+
+    ds = evaluate_account(_FakeGraph(campaigns, ads, insights), settings, cpa_ctx=(sold, {}, spend60))
+    by_id = {d.ad_id: d for d in ds}
+
+    assert by_id["winner"].should_pause is False and by_id["winner"].reason == cpa.CPL_RESCUED
+    assert by_id["winner_copy"].should_pause is True          # same creative, other ad set: not protected
+
+
+def test_rolling_7d_window_has_no_thursday_reset():
+    s = Settings(kpi=KpiCfg(cpl_lookback="rolling_7d"))
+    assert cpl_window(s, dt.date(2026, 10, 25)) == (None, {"since": "2026-10-19", "until": "2026-10-25"})
+
+
+def test_run_soft_reduce_disabled_keeps_classic_pause(monkeypatch):
+    monkeypatch.setattr("adbot.monitor_cpl.state.append_pause_log", lambda *a, **k: None)
+    settings = Settings(meta=MetaCfg(conversion_event="COMPLETE_REGISTRATION"),
+                        kpi=KpiCfg(cpl_threshold_myr=40, cpl_min_spend_myr=80,
+                                   cpl_lookback="last_3d", pause_zero_lead_after_spend=True))
+    campaigns = [{"id": "C", "name": "STOCKBLOOM | X", "effective_status": "ACTIVE"}]
+    ads = {"C": [_soft_ad("over", "AS1", 200)]}
+    graph = _FakeGraphSoft(campaigns, ads, {"over": _reg_insight(100, 1)})
+
+    out = run(graph, settings)
+
+    assert graph.paused == ["over"] and graph.budget_posts == []
+    assert out["paused"] == 1 and out["reduced"] == 0
+
+
+def test_cpa_hold_exempts_named_ad_from_hard_stop_only():
+    # owner 2026-09-21「开回 V8」: a cpa.hold substring keeps a reopened ad alive even though
+    # its 60d CPA sits over the hard stop; an un-held sibling still hard-stops, and the hold
+    # does NOT bypass CPL rules (that stays cpl_hold's job).
+    settings = Settings(meta=MetaCfg(conversion_event="COMPLETE_REGISTRATION"),
+                        kpi=KpiCfg(cpl_threshold_myr=40, cpl_min_spend_myr=80,
+                                   cpl_lookback="last_3d", pause_zero_lead_after_spend=True),
+                        cpa=CpaCfg(enabled=True, hard_stop_myr=1200, conversion_days=14,
+                                   min_spend_myr=1000, hold=["做么你 trading 不用看盘"]))
+    campaigns = [{"id": "A", "name": "STOCKBLOOM | DAY TRADING | 0905",
+                  "effective_status": "ACTIVE"}]
+    ads = {"A": [_ad("video 8：做么你 trading 不用看盘的？"), _ad("kill_me")]}
+    insights = {"video 8：做么你 trading 不用看盘的？": _reg_insight(100, 3),  # CPL 33 fine
+                "kill_me": _reg_insight(100, 4)}                               # CPL 25 fine
+    ck = cpa.norm("stockbloom | day trading | 0905")
+    sold = {(ck, "", cpa.norm("video 8：做么你 trading 不用看盘的？")): 1,
+            (ck, "", cpa.norm("kill_me")): 1}
+    spend60 = {"video 8：做么你 trading 不用看盘的？": 1900.0,  # CPA 1900 > 1200, held
+               "kill_me": 1900.0}                               # CPA 1900 > 1200, no hold
+    by_name = {d.name: d for d in evaluate_account(
+        _FakeGraph(campaigns, ads, insights), settings, cpa_ctx=(sold, spend60))}
+
+    held = by_name["video 8：做么你 trading 不用看盘的？"]
+    assert held.should_pause is False and held.reason == CPA_MANUAL_HOLD
+    assert by_name["kill_me"].should_pause is True
+    assert by_name["kill_me"].reason == cpa.HARD_STOP
+
+
+def test_banned_creative_overrides_every_rescue_and_hold():
+    # ⛔ owner 2026-09-23, after the 2nd account ban: a creative Meta has ever rejected
+    # never runs again. The ban must beat the CPL hold, the CPA rescue AND cpa.hold —
+    # it is evaluated last precisely so nothing can save it.
+    settings = Settings(
+        meta=MetaCfg(conversion_event="COMPLETE_REGISTRATION"),
+        kpi=KpiCfg(cpl_threshold_myr=40, cpl_min_spend_myr=80, cpl_lookback="last_3d",
+                   pause_zero_lead_after_spend=True, cpl_hold=["freestyle 1"]),
+        cpa=CpaCfg(enabled=True, hard_stop_myr=1200, conversion_days=14, min_spend_myr=1000,
+                   hold=["freestyle 1"]),
+        compliance=ComplianceCfg(banned_creatives=["freestyle 1", "trading 早就不是这样了"]))
+    campaigns = [{"id": "A", "name": "[SG] STOCKBLOOM | BROAD", "effective_status": "ACTIVE"}]
+    ads = {"A": [_ad("🌟 freestyle 1"),                              # banned, and cpl+cpa held
+                 _ad("拼接：Video 5：Trading 早就不是这样了！"),        # banned, great CPL
+                 _ad("HOOK：Video 12：不选 forex 不选黄金")]}          # clean winner -> untouched
+    insights = {"🌟 freestyle 1": _reg_insight(100, 4),               # CPL 25 — would keep
+                "拼接：Video 5：Trading 早就不是这样了！": _reg_insight(100, 5),  # CPL 20 — would keep
+                "HOOK：Video 12：不选 forex 不选黄金": _reg_insight(100, 4)}
+    ck = cpa.norm("[sg] stockbloom | broad")
+    sold = {(ck, "", cpa.norm("🌟 freestyle 1")): 5}                      # real sales, CPA 200 — rescued normally
+    spend60 = {"🌟 freestyle 1": 1000.0}
+
+    by_name = {d.name: d for d in evaluate_account(
+        _FakeGraph(campaigns, ads, insights), settings, cpa_ctx=(sold, spend60))}
+
+    assert by_name["🌟 freestyle 1"].should_pause is True
+    assert by_name["🌟 freestyle 1"].reason == BANNED_CREATIVE
+    assert by_name["拼接：Video 5：Trading 早就不是这样了！"].should_pause is True
+    assert by_name["拼接：Video 5：Trading 早就不是这样了！"].reason == BANNED_CREATIVE
+    assert by_name["HOOK：Video 12：不选 forex 不选黄金"].should_pause is False
+
+
+def test_cpl_paused_until_suspends_cpl_but_not_ban_or_cpa_hard_stop():
+    # owner 2026-10-08「停到周五」: SG restarted after 14 dark days with every carrier on RM50;
+    # day-1 learning CPL must trigger neither the soft-reduce nor the 0-reg pause. The ban
+    # list and the CPA hard-stop keep working through the window, and it self-expires.
+    import datetime as _dt
+    from adbot import cpa as _cpa
+    from adbot.monitor_cpl import CPL_SUSPENDED as _SUSP, OVER_THRESHOLD as _OVER, ZERO_RESULTS as _ZERO
+    from adbot.settings import ComplianceCfg as _Comp
+    today = (_dt.datetime.utcnow() + _dt.timedelta(hours=8)).date()
+    settings = Settings(
+        meta=MetaCfg(conversion_event="COMPLETE_REGISTRATION"),
+        kpi=KpiCfg(cpl_threshold_myr=95, cpl_min_spend_myr=142, cpl_lookback="last_3d",
+                   pause_zero_lead_after_spend=True, cpl_paused_until=today.isoformat()),
+        cpa=CpaCfg(enabled=True, hard_stop_myr=1200, conversion_days=14, min_spend_myr=1000),
+        compliance=_Comp(banned_creatives=["freestyle 1"]))
+    campaigns = [{"id": "A", "name": "[SG] STOCKBLOOM | BROAD", "effective_status": "ACTIVE"}]
+    ads = {"A": [_ad("over cpl"), _ad("zero reg"), _ad("🚫 freestyle 1"), _ad("cpa dead")]}
+    insights = {"over cpl": _reg_insight(300, 1),        # CPL 300 — would soft-reduce / pause
+                "zero reg": _reg_insight(200, 0),        # 0 reg past RM142 — would pause
+                "🚫 freestyle 1": _reg_insight(100, 5),  # great CPL, banned
+                "cpa dead": _reg_insight(100, 5)}        # great CPL, CPA 1500 with a real sale
+    ck = _cpa.norm("[sg] stockbloom | broad")
+    sold = {(ck, "", _cpa.norm("cpa dead")): 1}
+    spend60 = {"cpa dead": 1500.0}
+
+    by_name = {d.name: d for d in evaluate_account(
+        _FakeGraph(campaigns, ads, insights), settings, cpa_ctx=(sold, spend60))}
+    assert by_name["over cpl"].should_pause is False and by_name["over cpl"].reason == _SUSP
+    assert by_name["zero reg"].should_pause is False and by_name["zero reg"].reason == _SUSP
+    assert by_name["🚫 freestyle 1"].should_pause is True
+    assert by_name["🚫 freestyle 1"].reason == BANNED_CREATIVE
+    assert by_name["cpa dead"].should_pause is True and by_name["cpa dead"].reason == _cpa.HARD_STOP
+
+    # the window expired yesterday -> normal CPL judgment is back
+    settings.kpi.cpl_paused_until = (today - _dt.timedelta(days=1)).isoformat()
+    by_name = {d.name: d for d in evaluate_account(
+        _FakeGraph(campaigns, ads, insights), settings, cpa_ctx=(sold, spend60))}
+    assert by_name["over cpl"].should_pause is True and by_name["over cpl"].reason == _OVER
+    assert by_name["zero reg"].should_pause is True and by_name["zero reg"].reason == _ZERO
+
+
+def test_custom_conversion_ads_are_judged_on_their_own_results():
+    # owner 2026-10-16: Webinarkit ad sets optimize a custom conversion (custom_event_type OTHER).
+    # Listed ids are judged on offsite_conversion.custom.<id>; unlisted custom conversions stay out.
+    settings = Settings(meta=MetaCfg(conversion_event="COMPLETE_REGISTRATION", custom_conversions=["111"]),
+                        kpi=KpiCfg(cpl_threshold_myr=60, cpl_min_spend_myr=60,
+                                   cpl_lookback="last_3d", pause_zero_lead_after_spend=True))
+    campaigns = [{"id": "A", "name": "(Webinarkit) STOCKBLOOM | X", "effective_status": "ACTIVE"}]
+
+    def cc_ad(ad_id, cc):
+        return {"id": ad_id, "name": ad_id, "effective_status": "ACTIVE", "created_time": "2026-01-01",
+                "adset": {"promoted_object": {"custom_event_type": "OTHER", "custom_conversion_id": cc}}}
+
+    ads = {"A": [cc_ad("good", "111"), cc_ad("zero", "111"), cc_ad("other cc", "999")]}
+    insights = {"good": {"spend": "100", "actions": [{"action_type": "offsite_conversion.custom.111", "value": "4"}]},
+                "zero": {"spend": "100", "actions": [{"action_type": "offsite_conversion.fb_pixel_complete_registration", "value": "4"}]},
+                "other cc": {"spend": "100", "actions": []}}
+    by_name = {d.name: d for d in evaluate_account(_FakeGraph(campaigns, ads, insights), settings)}
+    assert set(by_name) == {"good", "zero"}
+    assert by_name["good"].should_pause is False          # CPL 25 on its custom conversion
+    assert by_name["zero"].should_pause is True           # 0 custom-conversion results past RM60
+
+
+def test_zero_reg_rm80_rule_runs_during_cpl_pause():
+    # owner 2026-10-18「今天开始，花满 RM80 还 0 报名就关」 while the over-line rules wait for 10/21.
+    import datetime as _dt
+    from adbot.monitor_cpl import CPL_SUSPENDED as _SUSP, ZERO_RESULTS as _ZERO, INSUFFICIENT_SPEND as _INS
+    today = (_dt.datetime.utcnow() + _dt.timedelta(hours=8)).date()
+    settings = Settings(meta=MetaCfg(conversion_event="COMPLETE_REGISTRATION"),
+                        kpi=KpiCfg(cpl_threshold_myr=95, cpl_min_spend_myr=142, cpl_lookback="last_3d",
+                                   pause_zero_lead_after_spend=True, cpl_paused_until=today.isoformat(),
+                                   zero_lead_spend_myr=80, zero_lead_during_pause=True))
+    campaigns = [{"id": "A", "name": "X", "effective_status": "ACTIVE"}]
+    ads = {"A": [_ad("zero 84"), _ad("zero 70"), _ad("over line")]}
+    insights = {"zero 84": _reg_insight(84, 0), "zero 70": _reg_insight(70, 0), "over line": _reg_insight(300, 1)}
+    by = {d.name: d for d in evaluate_account(_FakeGraph(campaigns, ads, insights), settings)}
+    assert by["zero 84"].should_pause is True and by["zero 84"].reason == _ZERO
+    assert by["zero 70"].should_pause is False and by["zero 70"].reason == _INS
+    assert by["over line"].should_pause is False and by["over line"].reason == _SUSP
+
+
+class _FakeGraphLife(_FakeGraph):
+    """Week-window insights vs since-launch insights (a time_range starting at veteran_since)."""
+
+    def __init__(self, campaigns, ads_by_campaign, week, life):
+        super().__init__(campaigns, ads_by_campaign, week)
+        self._life = life
+
+    def account_insights(self, account_path, *, level, fields, date_preset=None, time_range=None):
+        if time_range and time_range.get("since") == "2026-10-16":
+            return [{"ad_id": aid, **row} for aid, row in self._life.items()]
+        return super().account_insights(account_path, level=level, fields=fields,
+                                        date_preset=date_preset, time_range=time_range)
+
+
+def test_veteran_gets_higher_spend_floor_others_unchanged():
+    # owner 2026-11-06「1」: since-launch ≥10 regs at CPL ≤40 → judged only after RM150 this week.
+    settings = Settings(meta=MetaCfg(conversion_event="COMPLETE_REGISTRATION"),
+                        kpi=KpiCfg(cpl_threshold_myr=60, cpl_min_spend_myr=60, zero_lead_spend_myr=80,
+                                   cpl_lookback="last_3d", pause_zero_lead_after_spend=True,
+                                   veteran_min_regs=10, veteran_max_cpl_myr=40,
+                                   veteran_min_spend_myr=150, veteran_since="2026-10-16"))
+    campaigns = [{"id": "A", "name": "CAMP", "effective_status": "ACTIVE"}]
+    ads = {"A": [_ad("vet_zero"), _ad("vet_cpl"), _ad("vet_over_floor"), _ad("rookie_zero"), _ad("weak_history")]}
+    week = {"vet_zero": _reg_insight(81, 0), "vet_cpl": _reg_insight(120, 1), "vet_over_floor": _reg_insight(160, 0),
+            "rookie_zero": _reg_insight(81, 0), "weak_history": _reg_insight(81, 0)}
+    life = {"vet_zero": _reg_insight(786, 28), "vet_cpl": _reg_insight(354, 17), "vet_over_floor": _reg_insight(786, 28),
+            "rookie_zero": _reg_insight(156, 7), "weak_history": _reg_insight(585, 12)}   # 7 regs / CPL 49: not veterans
+
+    by = {d.ad_id: d for d in evaluate_account(_FakeGraphLife(campaigns, ads, week, life), settings)}
+
+    assert not by["vet_zero"].should_pause and by["vet_zero"].reason == "veteran_wait"
+    assert not by["vet_cpl"].should_pause and by["vet_cpl"].reason == "veteran_wait"
+    assert by["vet_over_floor"].should_pause                       # past RM150 with 0 regs: judged as usual
+    assert by["rookie_zero"].should_pause and by["weak_history"].should_pause
