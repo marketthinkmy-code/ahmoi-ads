@@ -7,7 +7,7 @@ Singapore, daily budget RM100, copy written in the style of MOI's existing cours
 Run through the ops workflow (adbot-ops.yml, script=build_moi_single_images_1109.py):
   confirm=false -> dry run: print every payload, create nothing
   confirm=true  -> upload the 5 images and create campaign / ad set / 5 ads, all PAUSED
-Refuses to run if a campaign with the same name already exists (no duplicates).
+Resumable: reuses the campaign / ad set / ads already created under these names (no duplicates).
 The owner reviews in Ads Manager and switches the campaign on by hand.
 """
 from __future__ import annotations
@@ -226,6 +226,8 @@ def main() -> None:
         "targeting": {"geo_locations": {"countries": countries},
                       "age_min": 18, "age_max": 65, "locales": [20, 21, 22],
                       "targeting_automation": {"advantage_audience": 1}},
+        # Meta: ads that include Singapore must declare this regional regulated category.
+        "regional_regulated_categories": ["SINGAPORE_UNIVERSAL"],
         "status": "PAUSED",
     }
 
@@ -257,20 +259,38 @@ def main() -> None:
         return
 
     g = graph_client(s)
-    if any(c.get("name") == CAMPAIGN_NAME for c in g.list_campaigns(account)):
-        raise SystemExit(f"campaign «{CAMPAIGN_NAME}» already exists — refusing to create a duplicate")
 
+    # Resumable: re-uploading an image returns the same hash, and a campaign / ad set /
+    # ad that already exists under this name is reused instead of created again.
     hashes = {}
     for ad in ADS:
         hashes[ad["file"]] = g.upload_image(account, str(IMG_DIR / ad["file"]))
         print(f"uploaded {ad['file']} -> {hashes[ad['file']]}")
 
-    campaign_id = g.create_campaign(account, **campaign)["id"]
-    print("campaign", campaign_id, "(PAUSED)")
-    adset_id = g.create_adset(account, campaign_id=campaign_id, **adset)["id"]
-    print("ad set", adset_id, "(PAUSED)")
+    same = [c for c in g.list_campaigns(account) if c.get("name") == CAMPAIGN_NAME]
+    if len(same) > 1:
+        raise SystemExit(f"{len(same)} campaigns named «{CAMPAIGN_NAME}» — clean up by hand first")
+    if same:
+        campaign_id = same[0]["id"]
+        print("campaign", campaign_id, "(already exists, reused)")
+    else:
+        campaign_id = g.create_campaign(account, **campaign)["id"]
+        print("campaign", campaign_id, "(PAUSED)")
+
+    adsets = {a["name"]: a["id"] for a in g._get_all(f"{campaign_id}/adsets", {"fields": "id,name"})}
+    if ADSET_NAME in adsets:
+        adset_id = adsets[ADSET_NAME]
+        print("ad set", adset_id, "(already exists, reused)")
+    else:
+        adset_id = g.create_adset(account, campaign_id=campaign_id, **adset)["id"]
+        print("ad set", adset_id, "(PAUSED)")
+
+    existing_ads = {a["name"] for a in g._get_all(f"{adset_id}/ads", {"fields": "id,name"})}
     ad_ids = []
     for ad in ADS:
+        if ad["name"] in existing_ads:
+            print(f"ad «{ad['name']}» already exists, skipped")
+            continue
         creative_id = g.create_adcreative(account, **creative(ad, hashes[ad["file"]]))["id"]
         new = g.create_ad(account, name=ad["name"], adset_id=adset_id,
                           creative={"creative_id": creative_id}, status="PAUSED",
